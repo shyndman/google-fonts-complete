@@ -2,6 +2,65 @@ const https = require('https');
 const postcss = require('postcss');
 const userAgents = require('./user-agents.json');
 
+const getPositiveInteger = (value, fallback) => {
+    const parsedValue = Number.parseInt(value, 10);
+
+    return parsedValue > 0
+        ? parsedValue
+        : fallback;
+};
+
+const REQUEST_CONCURRENCY = getPositiveInteger(process.env.GOOGLE_FONTS_CONCURRENCY, 24);
+const FONT_CONCURRENCY = getPositiveInteger(process.env.GOOGLE_FONTS_FONT_CONCURRENCY, 6);
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: REQUEST_CONCURRENCY });
+
+
+const mapLimit = async (items, limit, callback) => {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+
+    const workers = new Array(Math.min(limit, items.length))
+        .fill(null)
+        .map(async () => {
+            while (nextIndex < items.length) {
+                const index = nextIndex++;
+                results[index] = await callback(items[index], index);
+            }
+        });
+
+    await Promise.all(workers);
+
+    return results;
+};
+
+const createLimit = limit => {
+    let activeCount = 0;
+    const queue = [];
+
+    const runNext = () => {
+        if (activeCount >= limit || queue.length === 0) {
+            return;
+        }
+
+        activeCount++;
+        const { callback, resolve, reject } = queue.shift();
+
+        callback()
+            .then(resolve, reject)
+            .finally(() => {
+                activeCount--;
+                runNext();
+            });
+    };
+
+    return callback => new Promise((resolve, reject) => {
+        queue.push({ callback, resolve, reject });
+        runNext();
+    });
+};
+
+const limitRequest = createLimit(REQUEST_CONCURRENCY);
+
 
 const getSortedObject = object => {
     let sortedObject = {};
@@ -23,8 +82,11 @@ const getSortedObject = object => {
 
 const fetch = async(options, delay = 0) => {
     await new Promise(resolve => setTimeout(resolve, delay));
-    return new Promise((resolve) => {
-        https.get(options, response => {
+    return limitRequest(() => new Promise((resolve) => {
+        https.get({
+            ...options,
+            agent: httpsAgent
+        }, response => {
             let result = '';
 
             response.on('data', data => {
@@ -35,14 +97,51 @@ const fetch = async(options, delay = 0) => {
                 resolve(result);
             });
         });
+    }));
+};
+
+const mergeConvertedFont = (convertedFont, partialFont) => {
+    const variants = convertedFont.variants;
+
+    Object.keys(partialFont.variants).forEach(fontStyle => {
+        variants[fontStyle] = variants[fontStyle] || {};
+
+        Object.keys(partialFont.variants[fontStyle]).forEach(fontWeight => {
+            const existingVariant = variants[fontStyle][fontWeight] || {
+                local: [],
+                url: {}
+            };
+            const partialVariant = partialFont.variants[fontStyle][fontWeight];
+
+            partialVariant.local.forEach(localFont => {
+                if (existingVariant.local.indexOf(localFont) === -1) {
+                    existingVariant.local.push(localFont);
+                }
+            });
+
+            existingVariant.url = {
+                ...existingVariant.url,
+                ...partialVariant.url
+            };
+            variants[fontStyle][fontWeight] = existingVariant;
+        });
     });
+
+    return {
+        ...convertedFont,
+        variants,
+        unicodeRange: {
+            ...convertedFont.unicodeRange,
+            ...partialFont.unicodeRange
+        }
+    };
 };
 
 
 const convertFont = async ({ convertedFont, family, format }, fetchOptions) => {
     let { variants, unicodeRange } = convertedFont;
 
-    const css = await fetch(fetchOptions, Math.random() * 5000);
+    const css = await fetch(fetchOptions);
 
     if (css) {
         let subset = null;
@@ -127,9 +226,7 @@ const getFetchOptions = ({ family, variants, format, pathCb }) => {
 
 
 const convertFontsOptions = async (fonts, pathCb) => {
-    let results = {};
-
-    for (const font of fonts) {
+    const convertedFonts = await mapLimit(fonts, FONT_CONCURRENCY, async font => {
         const { family, variants, ...originalFont } = font;
 
         const agents = Object.keys(userAgents);
@@ -140,14 +237,38 @@ const convertFontsOptions = async (fonts, pathCb) => {
             unicodeRange: {}
         };
 
-        for (const format of agents) {
-            const optionsList = getFetchOptions({ family, variants, format, pathCb });
-            for (const options of optionsList) {
-                convertedFont = await convertFont({ convertedFont, family, format }, options);
+        const conversions = agents.reduce((acc, format) => [
+            ...acc,
+            ...getFetchOptions({ family, variants, format, pathCb })
+                .map(options => ({ format, options }))
+        ], []);
+
+        const partialFonts = await mapLimit(conversions, REQUEST_CONCURRENCY, ({ format, options }) => {
+            return convertFont({
+                convertedFont: {
+                    ...originalFont,
+                    variants: {},
+                    unicodeRange: {}
+                },
+                family,
+                format
+            }, options);
+        });
+
+        partialFonts.forEach(partialFont => {
+            if (partialFont) {
+                convertedFont = mergeConvertedFont(convertedFont, partialFont);
             }
-        }
+        });
+
+        return [family, convertedFont];
+    });
+
+    const results = {};
+
+    convertedFonts.forEach(([family, convertedFont]) => {
         results[family] = convertedFont;
-    }
+    });
 
     return results;
 };
@@ -166,6 +287,8 @@ const getChunkedFonts = fonts => fonts.reduce((acc, font) => {
 module.exports = {
     fetch,
     convertFont,
+    mapLimit,
+    mergeConvertedFont,
     getSortedObject,
     getFetchOptions,
     getChunkedFonts,
